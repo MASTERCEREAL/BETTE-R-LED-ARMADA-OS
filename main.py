@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -17,6 +18,15 @@ import decky
 LED_DIR = "/sys/class/leds"
 PS_DIR = "/sys/class/power_supply"
 SETTINGS_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
+
+
+def plugin_version():
+    """This build's version, from the package.json shipped next to main.py."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "package.json")) as f:
+            return str(json.load(f).get("version", ""))
+    except (OSError, ValueError):
+        return ""
 # LED state from before BETTR LED took over; on disk so a crash/restart can still restore it.
 SNAPSHOT_FILE = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "led_snapshot.json")
 
@@ -750,6 +760,51 @@ def armada_call(action, **payload):
     if not response.get("ok"):
         raise RuntimeError(response.get("error") or "Armada control call failed")
     return response.get("result", {})
+
+
+PW_CHECK = {"at": -1e9, "text": "checking..."}
+
+
+def _any_file(*patterns):
+    return any(glob.glob(p) for p in patterns)
+
+
+async def pipewire_video_check():
+    """What's on the device for reading gamescope's PipeWire video stream (a
+    lighter Ambilight), for the debug info. Checked at most every 30s."""
+    if time.monotonic() - PW_CHECK["at"] < 30:
+        return PW_CHECK["text"]
+    PW_CHECK["at"] = time.monotonic()
+    yes = lambda b: "yes" if b else "no"
+    gst = bool(shutil.which("gst-launch-1.0"))
+    pwsrc = _any_file("/usr/lib*/gstreamer-1.0/libgstpipewire.so", "/usr/lib/*/gstreamer-1.0/libgstpipewire.so")
+    gi = _any_file("/usr/lib*/python3*/site-packages/gi/__init__.py", "/usr/lib/python3/dist-packages/gi/__init__.py")
+    gst_typelib = _any_file("/usr/lib*/girepository-1.0/Gst-1.0.typelib", "/usr/lib/*/girepository-1.0/Gst-1.0.typelib")
+    libpw = _any_file("/usr/lib*/libpipewire-0.3.so*", "/usr/lib/*/libpipewire-0.3.so*")
+    # Is gamescope offering its video stream? Ask PipeWire as the session user.
+    stream = "unknown"
+    uid, gid, home = AudioMeter._session_user()
+    env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+    env.update({"XDG_RUNTIME_DIR": f"/run/user/{uid}", "HOME": home})
+    as_user = {"user": uid, "group": gid, "extra_groups": []} if os.getuid() == 0 and uid != 0 else {}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pw-cli", "ls", "Node", stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, env=env, cwd="/", **as_user)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), 3)
+            text = out.decode(errors="replace")
+            stream = "found" if re.search(r'node\.name = "gamescope', text) and "Video/Source" in text else "not found"
+        except asyncio.TimeoutError:
+            _stop_proc(proc)
+            stream = "pw-cli timed out"
+    except FileNotFoundError:
+        stream = "no pw-cli"
+    except Exception as e:
+        stream = f"error: {e}"[:60]
+    PW_CHECK["text"] = (f"gamescope stream {stream} · gst-launch {yes(gst)} · pipewiresrc {yes(pwsrc)}"
+                        f" · python gi {yes(gi)}/Gst {yes(gst_typelib)} · libpipewire {yes(libpw)}")
+    return PW_CHECK["text"]
 
 
 def discover_armada_commands():
@@ -1830,6 +1885,7 @@ class Plugin:
             "react": (f"listening via {self.meter.source}" if self.meter and self.meter.source and self.meter.running()
                       else (self.meter.error if self.meter and self.meter.error else "off")),
             "method": "Armada Control's service" if self.ctl else (self.sticks.method if self.sticks else "n/a"),
+            "pw_video": await pipewire_video_check(),
             "commands": discover_armada_commands(),
             "write_error": (self.ctl.last_error if self.ctl else "") or LAST_WRITE_ERROR[0]
             or (f"Armada re-apply: {ARMADA_REAPPLY_RESULT[0]}" if ARMADA_REAPPLY_RESULT[0] not in ("", "ok") else ""),
@@ -1849,6 +1905,7 @@ class Plugin:
             "rain": self.rain,
             "home_on": self.home_on,
             "home_hue": self.home_hue,
+            "version": plugin_version(),
         }
 
     async def set_home(self, on: bool, hue: int):

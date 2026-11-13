@@ -31,6 +31,7 @@ interface Settings {
   rain?: boolean;
   home_on?: boolean;
   home_hue?: number;
+  version?: string;
 }
 
 interface Game {
@@ -65,6 +66,7 @@ interface Status {
   write_check: string;
   react?: string;
   ambi?: string;
+  pw_video?: string;
   method: string;
   commands?: { service?: string[]; armada_control?: string[]; tool?: string };
   write_error: string;
@@ -205,6 +207,7 @@ function Content() {
             )}
             <div>LED React: {status.react ?? "off"}</div>
             <div>Ambilight: {status.ambi ?? "off"}</div>
+            <div>PipeWire video: {status.pw_video ?? "?"}</div>
             <div>Write check: {status.write_check}</div>
             {status.write_error && <div style={{ color: "#ff8080" }}>Write error: {status.write_error}</div>}
             <div>Stick LED files: {status.stick_count} of 24</div>
@@ -420,6 +423,7 @@ function Content() {
       <PanelSection>
         <div style={{ textAlign: "center", fontSize: 11, opacity: 0.6, letterSpacing: 1, padding: "8px 0" }}>
           MADE BY ILLMENTALITYAPPS
+          {settings.version && <div style={{ marginTop: 2 }}>v{settings.version}</div>}
         </div>
       </PanelSection>
     </>
