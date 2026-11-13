@@ -1,6 +1,6 @@
 {
   "name": "bettr-led",
-  "version": "1.15.9",
+  "version": "1.16.0",
   "description": "Breathes the LEDs orange while charging and sets per-game LED colors. Built by ILLMENTALITYAPPS.",
   "author": "ILLMENTALITYAPPS",
   "type": "module",

@@ -2,6 +2,7 @@ import array
 import asyncio
 import random
 import colorsys
+import glob
 import json
 import math
 import os
@@ -44,7 +45,9 @@ REACT_MAX_UPDATES = 40       # LED writes per second cap in LED React (eases the
 # Ambilight: the sticks take the main color shown on screen (left stick = left half,
 # right stick = right half). Screenshots come from gamescope itself (gamescopectl), the
 # method Armada's own ambilight used safely; ffmpeg shrinks each to a tiny image.
-AMBI_FPS = 3                 # screenshots per second
+AMBI_FAST = 0.5              # seconds between screenshots while the screen's colors change
+AMBI_SLOW = 2.0              # ...stretching up to this while they stay the same (saves power)
+AMBI_SAME = 24               # color change (0-255 per channel) that counts as "the same"
 AMBI_W, AMBI_H = 32, 18      # size the screenshot is shrunk to before picking a color
 AMBI_GLIDE = 0.12            # how far the LED color moves toward the screen color per frame
 SCREEN = "screen"            # marks "color comes from the screen" in a look
@@ -300,6 +303,56 @@ def dominant_color(px, x0, x1):
     return tuple(c * 255 / m for c in col)
 
 
+def _screen_sizes():
+    """Likely (width, height) of gamescope's output, from the display's modes,
+    landscape first."""
+    sizes = []
+    for d in sorted(glob.glob("/sys/class/drm/card*-*")):
+        if _read(os.path.join(d, "status")) != "connected":
+            continue
+        m = re.match(r"(\d+)x(\d+)", _read(os.path.join(d, "modes")))
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            for size in ((max(w, h), min(w, h)), (min(w, h), max(w, h))):
+                if size not in sizes:
+                    sizes.append(size)
+    return sizes
+
+
+def nv12_to_tiny(data, sizes):
+    """A raw NV12 frame from gamescope (no PNG) shrunk to AMBI_W x AMBI_H rgb24 by
+    reading a few pixels per cell, or None if its layout isn't one we can be sure of
+    (then the PNG way is used instead). Only exact size matches are trusted, so a
+    padded or unexpected layout can't produce wrong colors."""
+    n = len(data)
+    for w, h in sizes:
+        for align in (1, 16, 32, 64, 128, 256, 512):
+            pitch = -(-w // align) * align
+            if pitch * h + pitch * ((h + 1) // 2) == n:
+                break
+        else:
+            continue
+        uv0 = pitch * h
+        out = bytearray()
+        for cy in range(AMBI_H):
+            for cx in range(AMBI_W):
+                r = g = b = 0.0
+                for sy in (0.25, 0.75):
+                    for sx in (0.25, 0.75):
+                        x = int((cx + sx) * w / AMBI_W)
+                        y = int((cy + sy) * h / AMBI_H)
+                        yy = data[y * pitch + x]
+                        c = uv0 + (y // 2) * pitch + (x // 2) * 2
+                        u, v = data[c] - 128, data[c + 1] - 128
+                        yv = 1.164 * (yy - 16)  # BT.709, limited range
+                        r += yv + 1.793 * v
+                        g += yv - 0.213 * u - 0.533 * v
+                        b += yv + 2.112 * u
+                out += bytes(max(0, min(255, round(c / 4))) for c in (r, g, b))
+        return bytes(out)
+    return None
+
+
 def _stop_proc(proc):
     if proc.returncode is None:
         try:
@@ -318,6 +371,8 @@ class ScreenSampler:
         self.error = ""
         self.target = [(255, 255, 255), (255, 255, 255)]
         self.current = [[255.0, 255.0, 255.0], [255.0, 255.0, 255.0]]
+        self.raw_ok = None   # gamescope can give raw frames (None = not tried yet)
+        self.sizes = None
 
     def running(self):
         return self.task is not None and not self.task.done()
@@ -355,15 +410,19 @@ class ScreenSampler:
     async def _run(self):
         uid, gid, home = AudioMeter._session_user()
         runtime = os.path.join(RUN_USER_DIR, str(uid))
+        # /run/user/<uid> is in memory (tmpfs), so screenshots never touch storage.
         shot = os.path.join(runtime, ".bettr-led-screen.png")
+        raw = os.path.join(runtime, ".bettr-led-screen.nv12.bin")
         as_user = {}
         if os.getuid() == 0 and uid != 0:
             as_user = {"user": uid, "group": gid, "extra_groups": []}
+        gap = AMBI_FAST
         while True:
             began = time.monotonic()
+            before = list(self.target)
             try:
-                await self._capture(runtime, shot, home, as_user)
-                self.source, self.error = "gamescopectl", ""
+                await self._capture(runtime, shot, raw, home, as_user)
+                self.error = ""
             except asyncio.CancelledError:
                 raise
             except FileNotFoundError as e:
@@ -371,17 +430,68 @@ class ScreenSampler:
             except Exception as e:
                 self.error = str(e)[:120]
             finally:
-                try:
-                    os.remove(shot)
-                except OSError:
-                    pass
-            await asyncio.sleep(max(0.05, 1 / AMBI_FPS - (time.monotonic() - began)))
+                for f in (shot, raw):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+            # Same colors as last time: wait longer before the next screenshot.
+            same = all(abs(a - b) < AMBI_SAME for t0, t1 in zip(before, self.target) for a, b in zip(t0, t1))
+            gap = min(AMBI_SLOW, gap * 1.5) if same else AMBI_FAST
+            await asyncio.sleep(max(0.05, gap - (time.monotonic() - began)))
 
-    async def _capture(self, runtime, shot, home, as_user):
+    async def _capture(self, runtime, shot, raw, home, as_user):
         display = self._display(runtime)
         env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
         env.update({"XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": display,
                     "GAMESCOPE_WAYLAND_DISPLAY": display, "HOME": home})
+        if self.raw_ok is not False:
+            # Raw frame: gamescope skips the PNG compression and ffmpeg isn't needed.
+            # Older gamescope can't do this; then it's PNG from here on.
+            if self.sizes is None:
+                self.sizes = _screen_sizes()
+            try:
+                got = await self._shoot(raw, env, as_user, 2 if self.raw_ok else 0.6)
+            except RuntimeError:
+                got = False
+            if got:
+                with open(raw, "rb") as f:
+                    px = nv12_to_tiny(f.read(), self.sizes)
+                if px is not None:
+                    self.raw_ok, self.source = True, "gamescope raw frames"
+                    self._pick(px)
+                    return
+            if self.raw_ok:
+                raise RuntimeError("raw frame never arrived")
+            self.raw_ok = False
+        if not await self._shoot(shot, env, as_user, 2):
+            raise RuntimeError("screenshot never arrived")
+        self.source = "gamescope PNG"
+        ff = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-v", "error", "-i", shot, "-vf", f"scale={AMBI_W}:{AMBI_H}:flags=area",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-", stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, cwd="/")
+        try:
+            out, _ = await asyncio.wait_for(ff.communicate(), 3)
+        except asyncio.TimeoutError:
+            ff.kill()
+            raise RuntimeError("ffmpeg timed out")
+        except asyncio.CancelledError:
+            _stop_proc(ff)
+            raise
+        if len(out) < AMBI_W * AMBI_H * 3:
+            raise RuntimeError("couldn't read the screenshot")
+        self._pick(out)
+
+    def _pick(self, px):
+        half = AMBI_W // 2
+        for i, (x0, x1) in enumerate(((0, half), (half, AMBI_W))):
+            col = dominant_color(px, x0, x1)
+            if col is not None:  # a black screen keeps the last color
+                self.target[i] = col
+
+    async def _shoot(self, shot, env, as_user, wait):
+        """Ask gamescope for a screenshot; True once the file is fully written."""
         try:
             os.remove(shot)
         except OSError:
@@ -401,37 +511,17 @@ class ScreenSampler:
         if rc:
             raise RuntimeError(f"gamescopectl failed ({rc})")
         # gamescope writes the file after the command returns: wait for it to settle.
-        last, deadline = -1, time.monotonic() + 2
+        last, deadline = -1, time.monotonic() + wait
         while time.monotonic() < deadline:
             try:
                 size = os.path.getsize(shot)
             except OSError:
                 size = -1
             if size > 0 and size == last:
-                break
+                return True
             last = size
             await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError("screenshot never arrived")
-        ff = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error", "-i", shot, "-vf", f"scale={AMBI_W}:{AMBI_H}:flags=area",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-", stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, cwd="/")
-        try:
-            out, _ = await asyncio.wait_for(ff.communicate(), 3)
-        except asyncio.TimeoutError:
-            ff.kill()
-            raise RuntimeError("ffmpeg timed out")
-        except asyncio.CancelledError:
-            _stop_proc(ff)
-            raise
-        if len(out) < AMBI_W * AMBI_H * 3:
-            raise RuntimeError("couldn't read the screenshot")
-        half = AMBI_W // 2
-        for i, (x0, x1) in enumerate(((0, half), (half, AMBI_W))):
-            col = dominant_color(out, x0, x1)
-            if col is not None:  # a black screen keeps the last color
-                self.target[i] = col
+        return False
 
 
 def react_level(pulse, flash):
