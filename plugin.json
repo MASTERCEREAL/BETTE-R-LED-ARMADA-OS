@@ -1,0 +1,11 @@
+{
+  "name": "BETT-R LED",
+  "author": "ILLMENTALITYAPPS",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["led", "battery", "charging"],
+    "description": "Breathes the LEDs orange while charging and sets per-game LED colors. Built by ILLMENTALITYAPPS.",
+    "image": ""
+  }
+}
